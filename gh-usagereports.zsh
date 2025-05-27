@@ -16,6 +16,9 @@ MAX_ITEMS=100
 OUTPUT_FILE=""
 DETAILED_REPOS=false
 MAX_REPOS=50
+ENV_FILE=".env"  # Default .env file path
+GITHUB_TOKEN=""   # Will be loaded from .env if available
+GITHUB_USERNAME="" # Will be loaded from .env if available
 
 # Function to display usage information
 usage() {
@@ -32,13 +35,67 @@ usage() {
   echo "  ${fg[cyan]}-d, --detailed${reset_color}            Get detailed repository information for each organization"
   echo "  ${fg[cyan]}-r, --max-repos N${reset_color}         Maximum number of repositories per organization [default: 50]"
   echo "  ${fg[cyan]}-v, --verbose${reset_color}             Enable verbose output"
+  echo "  ${fg[cyan]}--env-file FILE${reset_color}           Path to .env file with GitHub API token [default: .env]"
   echo ""
   echo "${fg[yellow]}Examples:${reset_color}"
   echo "  $0 --url https://github.example.com"
   echo "  $0 --url https://github.example.com --format json --output orgs.json"
   echo "  $0 --url https://github.example.com --detailed --max-repos 100"
   echo "  $0 --url https://github.example.com --detailed --format csv --output detailed_repos.csv"
+  echo "  $0 --env-file ./custom.env --url https://github.example.com"
   echo ""
+}
+
+# Function to load environment variables from a .env file
+load_env_file() {
+  local env_file=$1
+
+  if [[ -f "$env_file" ]]; then
+    if [[ $VERBOSE == true ]]; then
+      echo "${fg[yellow]}Loading environment variables from $env_file${reset_color}"
+    fi
+    
+    # Read the .env file line by line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # Skip comments and empty lines
+      if [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]; then
+        continue
+      fi
+      
+      # Remove leading/trailing whitespace and export the variable
+      line=$(echo "$line" | xargs)
+      # Zsh pattern matching is different from Bash
+      if [[ "$line" == [A-Za-z0-9_]*=* ]]; then
+        # Extract key and value using parameter expansion
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        
+        # Remove quotes if present
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+        
+        # Export the variable
+        export "$key"="$value"
+        
+        if [[ $VERBOSE == true ]]; then
+          if [[ "$key" == *TOKEN* || "$key" == *SECRET* || "$key" == *KEY* || "$key" == *PASSWORD* ]]; then
+            echo "${fg[yellow]}Loaded $key=********${reset_color}"
+          else
+            echo "${fg[yellow]}Loaded $key=$value${reset_color}"
+          fi
+        fi
+      fi
+    done < "$env_file"
+  else
+    if [[ $VERBOSE == true ]]; then
+      echo "${fg[yellow]}Environment file $env_file not found${reset_color}"
+    fi
+    return 1
+  fi
+  
+  return 0
 }
 
 # Function to check if GitHub CLI is installed
@@ -60,18 +117,92 @@ check_gh_auth() {
     local hostname=$(echo $enterprise_url | sed -e 's|^https\?://||' -e 's|/.*$||')
     echo "${fg[yellow]}Setting GitHub Enterprise hostname to: $hostname${reset_color}"
     
-    # Check if already authenticated to this hostname
     # Set GH_HOST environment variable
     export GH_HOST="$hostname"
     
-    if ! gh auth status &> /dev/null; then
-      echo "${fg[yellow]}Please authenticate to GitHub Enterprise: $hostname${reset_color}"
-      gh auth login --hostname $hostname
+    # Check if we have a GitHub token from environment variables (loaded from .env)
+    if [[ -n $GITHUB_TOKEN ]]; then
+      if [[ $VERBOSE == true ]]; then
+        if [[ -n $GITHUB_USERNAME ]]; then
+          echo "${fg[yellow]}Using GitHub token for user: $GITHUB_USERNAME${reset_color}"
+        else
+          echo "${fg[yellow]}Using GitHub token from environment variable${reset_color}"
+          echo "${fg[yellow]}Hint: Adding GITHUB_USERNAME to your .env file may help with authentication${reset_color}"
+        fi
+      fi
+      # Set the token for GitHub CLI
+      export GH_TOKEN="$GITHUB_TOKEN"
       
-      # Check if authentication was successful
-      if [ $? -ne 0 ]; then
-        echo "${fg[red]}Authentication failed${reset_color}"
-        exit 1
+      # Verify the token works
+      if ! gh auth status &> /dev/null; then
+        echo "${fg[red]}Authentication failed using the provided token${reset_color}"
+        
+        # Check for common issues
+        if [[ -z $GITHUB_USERNAME ]]; then
+          echo "${fg[yellow]}Hint: Adding GITHUB_USERNAME to your .env file may help with authentication${reset_color}"
+        fi
+        
+        # Try to get more detailed error information
+        gh_error=$(gh auth status 2>&1)
+        echo "${fg[red]}Error details: ${gh_error}${reset_color}"
+        
+        echo "${fg[yellow]}Falling back to regular GitHub CLI authentication...${reset_color}"
+        # Clear the potentially invalid token
+        unset GH_TOKEN
+        
+        # Continue with regular CLI authentication
+        if ! gh auth status &> /dev/null; then
+          echo "${fg[yellow]}Please authenticate to GitHub Enterprise: $hostname${reset_color}"
+             # If we have a username, show it as a hint but don't try to use it directly
+        if [[ -n $GITHUB_USERNAME ]]; then
+          echo "${fg[yellow]}Hint: Use $GITHUB_USERNAME as your username when prompted${reset_color}"
+        fi
+        
+        # Use web-based authentication with appropriate scopes
+        if [[ $VERBOSE == true ]]; then
+          gh auth login --hostname $hostname --web --scopes "repo,read:org"
+        else
+          gh auth login --hostname $hostname --web --scopes "repo,read:org" &> /dev/null
+        fi
+          
+          # Check if authentication was successful
+          if [ $? -ne 0 ]; then
+            echo "${fg[red]}Authentication failed${reset_color}"
+            exit 1
+          fi
+        fi
+      else
+        if [[ $VERBOSE == true ]]; then
+          echo "${fg[green]}Successfully authenticated using API token${reset_color}"
+        fi
+      fi
+    else
+      # No API key found, use regular GitHub CLI authentication
+      if [[ $VERBOSE == true ]]; then
+        echo "${fg[yellow]}No GITHUB_TOKEN found in environment variables${reset_color}"
+        echo "${fg[yellow]}Using regular GitHub CLI authentication${reset_color}"
+      fi
+      
+      if ! gh auth status &> /dev/null; then
+        echo "${fg[yellow]}Please authenticate to GitHub Enterprise: $hostname${reset_color}"
+        
+        # If we have a username, show it as a hint but don't try to use it directly
+        if [[ -n $GITHUB_USERNAME ]]; then
+          echo "${fg[yellow]}Hint: Use $GITHUB_USERNAME as your username when prompted${reset_color}"
+        fi
+        
+        # Use web-based authentication with appropriate scopes
+        if [[ $VERBOSE == true ]]; then
+          gh auth login --hostname $hostname --web --scopes "repo,read:org"
+        else
+          gh auth login --hostname $hostname --web --scopes "repo,read:org" &> /dev/null
+        fi        gh auth login --hostname <valtech-github-hostname> --with-token
+        
+        # Check if authentication was successful
+        if [ $? -ne 0 ]; then
+          echo "${fg[red]}Authentication failed${reset_color}"
+          exit 1
+        fi
       fi
     fi
   fi
@@ -194,7 +325,7 @@ list_organizations() {
     fi
   else
     org_nodes=$(echo "$result" | jq -r '.data.organizations.nodes')
-    if [[ $VERBOSE == true ]]; then    ./gh-usagereports.zsh --url https://github.com/enterprises/pmsmvp --detailed --verbose    ./gh-usagereports.zsh --url https://github.com/enterprises/pmsmvp --detailed --verbose
+    if [[ $VERBOSE == true ]]; then
       echo "${fg[yellow]}Extracting data from GitHub Enterprise response (organizations)${reset_color}"
     fi
   fi
@@ -425,6 +556,11 @@ while [[ $# -gt 0 ]]; do
       shift
       shift
       ;;
+    --env-file)
+      ENV_FILE="$2"
+      shift
+      shift
+      ;;
     *)
       echo "${fg[red]}Error: Unknown option $key${reset_color}"
       usage
@@ -435,6 +571,15 @@ done
 
 # Main execution
 check_gh_cli
+
+# Load environment variables from .env file if it exists
+if [[ -n $ENV_FILE ]]; then
+  if load_env_file "$ENV_FILE"; then
+    echo "${fg[green]}Loaded environment variables from $ENV_FILE${reset_color}"
+  else
+    echo "${fg[yellow]}Note: No .env file found at $ENV_FILE or unable to load it${reset_color}"
+  fi
+fi
 
 # Validate and set required parameters
 if [[ -z $GH_ENTERPRISE_URL ]]; then
@@ -568,7 +713,7 @@ if [[ $DETAILED_REPOS == true ]]; then
     echo "${fg[yellow]}No organizations found. Cannot proceed with detailed reporting.${reset_color}"
     exit 0
   fi
-    ./gh-usagereports.zsh --url https://github.com/enterprises/pmsmvp --detailed --verbose    ./gh-usagereports.zsh --url https://github.com/enterprises/pmsmvp --detailed --verbose
+  
   # Extract organization logins from JSON output into a proper zsh array
   org_logins=()
   while IFS= read -r login; do
